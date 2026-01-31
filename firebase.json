@@ -1,0 +1,32 @@
+{
+  "hosting": {
+    "public": "build/web",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  },
+  "flutter": {
+    "platforms": {
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "sistem-tracker-t",
+          "configurations": {
+            "android": "1:772116009786:android:923768118381c89b2ff603",
+            "ios": "1:772116009786:ios:c93c7cf887d7cbe82ff603",
+            "macos": "1:772116009786:ios:c93c7cf887d7cbe82ff603",
+            "web": "1:772116009786:web:37cb96bac0dac0ee2ff603",
+            "windows": "1:772116009786:web:8a180b0a08e65bc32ff603"
+          }
+        }
+      }
+    }
+  }
+}

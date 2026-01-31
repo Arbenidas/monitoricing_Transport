@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cámara de Conteo - Bus Test</title>
+    <!-- Firebase JS SDK -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
+    <!-- TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #000; color: white; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; }
+        h1 { font-size: 1.2rem; margin-bottom: 0.5rem; text-align: center; }
+        #device-id-display { font-size: 0.9rem; color: #4ade80; margin-bottom: 1rem; font-family: monospace; }
+        #video-container { position: relative; width: 100%; max-width: 480px; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,255,0,0.2); }
+        video { width: 100%; display: block; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        .stats { margin-top: 20px; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+        .stat-box { background: #333; padding: 10px 15px; border-radius: 8px; text-align: center; min-width: 70px; }
+        .stat-value { font-size: 1.5rem; font-weight: bold; color: #4ade80; }
+        .stat-label { font-size: 0.7rem; color: #aaa; }
+        button { margin-top: 20px; background: #2563eb; color: white; border: none; padding: 12px 24px; border-radius: 50px; font-size: 1rem; cursor: pointer; }
+        #status { margin-top: 10px; font-size: 0.8rem; color: #888; }
+        #gps-status { margin-top: 5px; font-size: 0.75rem; color: #fbbf24; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h1>🎥 Modo Sensor Inteligente</h1>
+    <div id="device-id-display">ID: Cargando...</div>
+    
+    <div id="video-container">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+    </div>
+
+    <div class="stats">
+        <div class="stat-box">
+            <div class="stat-value" id="current-val">0</div>
+            <div class="stat-label">EN VISIÓN</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value" id="in-val" style="color: #60a5fa">0</div>
+            <div class="stat-label">ENTRADAS</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value" id="out-val" style="color: #f87171">0</div>
+            <div class="stat-label">SALIDAS</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value" id="fps-val">0</div>
+            <div class="stat-label">FPS</div>
+        </div>
+    </div>
+
+    <div id="status">Esperando cámara...</div>
+    <div id="gps-status">GPS: Esperando...</div>
+    <button onclick="startCamera()">Iniciar Cámara</button>
+
+    <script>
+        // --- CONFIGURACIÓN ---
+        const firebaseConfig = {
+          apiKey: "AIzaSyAiXm3hPBdqkKA8mRBegUhz3bCBIeT2MWc",
+          authDomain: "sistem-tracker-t.firebaseapp.com",
+          projectId: "sistem-tracker-t",
+          storageBucket: "sistem-tracker-t.firebasestorage.app",
+          messagingSenderId: "772116009786",
+          appId: "1:772116009786:web:37cb96bac0dac0ee2ff603"
+        };
+
+        // Get Device ID from URL or LocalStorage
+        const urlParams = new URLSearchParams(window.location.search);
+        let deviceId = urlParams.get('id');
+
+        if (deviceId) {
+            // New ID provided in URL, save it
+            localStorage.setItem('monitor_device_id', deviceId);
+        } else {
+            // No URL param, try to load from storage
+            deviceId = localStorage.getItem('monitor_device_id');
+        }
+
+        // Fallback if completely new
+        if (!deviceId) {
+            deviceId = 'cam_' + Math.floor(Math.random() * 10000);
+            localStorage.setItem('monitor_device_id', deviceId);
+        }
+
+        document.getElementById('device-id-display').innerText = `ID: ${deviceId}`;
+
+        // --- TRACKER LOGIC ---
+        class SimpleTracker {
+            constructor() {
+                this.objects = []; // { id, x, y, w, h, lastSeen, history: [] }
+                this.nextId = 1;
+                this.maxDistance = 100; // Pixels to consider same object
+                this.lineY = 0.5; // Virtual line at 50% height
+                this.lineY = 0.5; // Virtual line at 50% height
+                this.lineY = 0.5; // Virtual line at 50% height
+                this.counts = { in: 0, out: 0, lastEntryTime: 0 };
+                this.location = { lat: 0, lng: 0 }; // New Location Field
+            }
+
+            update(detections, width, height) {
+                const currentFrameObjects = [];
+                const timestamp = Date.now();
+
+                // 1. Convert detections to centroids
+                detections.forEach(det => {
+                    if (det.class === 'person' && det.score > 0.5) {
+                        const [x, y, w, h] = det.bbox;
+                        const cx = x + w / 2;
+                        const cy = y + h / 2;
+                        currentFrameObjects.push({ cx, cy, w, h, matched: false });
+                    }
+                });
+
+                // 2. Match with existing objects
+                this.objects.forEach(obj => {
+                    let bestDist = Infinity;
+                    let bestMatch = null;
+
+                    currentFrameObjects.forEach(det => {
+                        if (det.matched) return;
+                        const dist = Math.hypot(det.cx - obj.cx, det.cy - obj.cy);
+                        if (dist < this.maxDistance && dist < bestDist) {
+                            bestDist = dist;
+                            bestMatch = det;
+                        }
+                    });
+
+                    if (bestMatch) {
+                        // Update object
+                        bestMatch.matched = true;
+                        obj.lastSeen = timestamp;
+                        
+                        // Check Line Crossing
+                        const oldY = obj.cy;
+                        const newY = bestMatch.cy;
+                        const linePixel = height * this.lineY;
+
+                        // UP -> DOWN (Entry? Depends on camera mount)
+                        // Let's assume Top-Down view where Down is Entering
+                        if (oldY < linePixel && newY >= linePixel) {
+                            this.counts.in++;
+                            this.counts.lastEntryTime = Date.now(); // Record Timestamp
+                            console.log(`Person ${obj.id} ENTRÓ`);
+                        }
+                        // DOWN -> UP (Exit)
+                        else if (oldY > linePixel && newY <= linePixel) {
+                            this.counts.out++;
+                            console.log(`Person ${obj.id} SALIÓ`);
+                        }
+
+                        obj.cx = bestMatch.cx;
+                        obj.cy = bestMatch.cy;
+                        obj.w = bestMatch.w;
+                        obj.h = bestMatch.h;
+                    }
+                });
+
+                // 3. Register new objects
+                currentFrameObjects.forEach(det => {
+                    if (!det.matched) {
+                        this.objects.push({
+                            id: this.nextId++,
+                            cx: det.cx,
+                            cy: det.cy,
+                            w: det.w,
+                            h: det.h,
+                            lastSeen: timestamp
+                        });
+                    }
+                });
+
+                // 4. Remove stale objects (not seen for 1 sec)
+                this.objects = this.objects.filter(obj => timestamp - obj.lastSeen < 1000);
+
+                return this.objects;
+            }
+        }
+
+        const tracker = new SimpleTracker();
+
+        // --- FIREBASE INIT ---
+        let db;
+        try {
+            firebase.initializeApp(firebaseConfig);
+            db = firebase.firestore();
+            console.log("Firebase Connected");
+        } catch(e) {
+            console.error("Firebase Error:", e);
+        }
+
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('overlay');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        let model = undefined;
+        let lastFrameTime = 0;
+
+        async function startCamera() {
+            startGeolocation(); // Start tracking location
+            statusEl.innerText = "Cargando modelo AI...";
+            model = await cocoSsd.load();
+            statusEl.innerText = "Accediendo a cámara...";
+            
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: 'environment', width: 640 } 
+                });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    requestAnimationFrame(predictLoop);
+                    statusEl.innerText = "🟢 Sistema de Rastreo Activo";
+                };
+            } catch (err) {
+                statusEl.innerText = "Error: " + err.message;
+            }
+        }
+
+        function startGeolocation() {
+            const gpsEl = document.getElementById('gps-status');
+            if ("geolocation" in navigator) {
+                gpsEl.innerText = "GPS: Solicitando permiso...";
+                navigator.geolocation.watchPosition(
+                    (position) => {
+                         tracker.location.lat = position.coords.latitude;
+                         tracker.location.lng = position.coords.longitude;
+                         const acc = Math.round(position.coords.accuracy);
+                         gpsEl.innerText = `GPS: ${tracker.location.lat.toFixed(4)}, ${tracker.location.lng.toFixed(4)} (±${acc}m)`;
+                         gpsEl.style.color = "#4ade80"; // Green
+                         console.log("Location updated:", tracker.location);
+                    },
+                    (error) => {
+                         let msg = "Error";
+                         switch(error.code) {
+                             case error.PERMISSION_DENIED: msg = "Permiso denegado"; break;
+                             case error.POSITION_UNAVAILABLE: msg = "Señal no disponible"; break;
+                             case error.TIMEOUT: msg = "Tiempo de espera agotado"; break;
+                         }
+                         console.warn("Geolocation Error:", error.message);
+                         gpsEl.innerText = `GPS Error: ${msg}`;
+                         gpsEl.style.color = "#f87171"; // Red
+                    },
+                    { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 }
+                );
+            } else {
+                console.log("Geolocation NOT available");
+                gpsEl.innerText = "GPS: No soportado en este navegador";
+            }
+        }
+
+        async function predictLoop() {
+            if (!model) return;
+            const predictions = await model.detect(video);
+            
+            // Get screen dimensions
+            const w = canvas.width;
+            const h = canvas.height;
+
+            // Run Tracker
+            const trackedObjects = tracker.update(predictions, w, h);
+
+            // Clear Canvas
+            ctx.clearRect(0, 0, w, h);
+            ctx.textBaseline = 'top';
+
+            // Draw Virtual Line
+            const lineY = h * tracker.lineY;
+            ctx.strokeStyle = '#FFFF00';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([10, 5]);
+            ctx.beginPath();
+            ctx.moveTo(0, lineY);
+            ctx.lineTo(w, lineY);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#FFFF00';
+            ctx.fillText("LÍNEA DE CONTEO", 10, lineY - 15);
+
+            // Draw Objects
+            trackedObjects.forEach(obj => {
+               const x = obj.cx - obj.w/2;
+               const y = obj.cy - obj.h/2;
+               
+               // Box
+               ctx.strokeStyle = '#00FFFF';
+               ctx.lineWidth = 3;
+               ctx.strokeRect(x, y, obj.w, obj.h);
+
+               // ID Label
+               ctx.fillStyle = '#00FFFF';
+               ctx.fillRect(x, y - 25, obj.w, 25);
+               ctx.fillStyle = '#000000';
+               ctx.font = 'bold 16px sans-serif';
+               ctx.fillText(`ID: ${obj.id}`, x + 5, y - 20);
+            });
+
+            // Update UI Stats
+            document.getElementById('current-val').innerText = trackedObjects.length;
+            document.getElementById('in-val').innerText = tracker.counts.in;
+            document.getElementById('out-val').innerText = tracker.counts.out;
+            
+            // Calc FPS
+            const now = performance.now();
+            const fps = 1000 / (now - lastFrameTime);
+            lastFrameTime = now;
+            document.getElementById('fps-val').innerText = Math.round(fps);
+
+            // Send to Firestore (Throttled)
+            if (now % 1000 < 100) { 
+                sendTelemetry(trackedObjects, tracker.counts);
+            }
+
+            requestAnimationFrame(predictLoop);
+        }
+
+        function sendTelemetry(objects, counts) {
+             const lowResCanvas = document.createElement('canvas');
+            const w = 160;
+            const h = 120;
+            lowResCanvas.width = w;
+            lowResCanvas.height = h; 
+            const ctxLow = lowResCanvas.getContext('2d');
+            
+            // Draw Video
+            ctxLow.drawImage(video, 0, 0, w, h);
+
+            // Scale & Draw for Dashboard
+            const scaleX = w / video.videoWidth;
+            const scaleY = h / video.videoHeight;
+
+            // Draw Line on dashboard thumb
+             ctxLow.strokeStyle = '#FFFF00';
+             ctxLow.lineWidth = 1;
+             ctxLow.beginPath();
+             ctxLow.moveTo(0, h * 0.5);
+             ctxLow.lineTo(w, h * 0.5);
+             ctxLow.stroke();
+
+            objects.forEach(obj => {
+                 const x = (obj.cx - obj.w/2) * scaleX;
+                 const y = (obj.cy - obj.h/2) * scaleY;
+                 ctxLow.strokeStyle = '#00FFFF';
+                 ctxLow.lineWidth = 2;
+                 ctxLow.strokeRect(x, y, obj.w * scaleX, obj.h * scaleY);
+            });
+
+            const base64 = lowResCanvas.toDataURL('image/jpeg', 0.5);
+
+            // Usar el deviceId de la URL para el documento
+            db.collection("live_stream").doc(deviceId).set({
+                current_people: objects.length,
+                total_in: counts.in,
+                total_out: counts.out,
+                last_entry_ts: counts.lastEntryTime,
+                last_updated: firebase.firestore.FieldValue.serverTimestamp(),
+                image_base64: base64,
+                device_id: deviceId,
+                location: new firebase.firestore.GeoPoint(tracker.location.lat, tracker.location.lng) // Sent GeoPoint
+            }, { merge: true });
+        }
+    </script>
+</body>
+</html>
